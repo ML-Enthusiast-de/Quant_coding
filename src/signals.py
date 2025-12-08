@@ -39,6 +39,38 @@ def make_basic_signals(prices: pd.Series) -> pd.DataFrame:
 
     return df
 
+def build_sequence_dataset(
+    X: np.ndarray,
+    y: np.ndarray,
+    dates: pd.Index,
+    seq_len: int = 30,
+):
+    """
+    Build a (num_samples, seq_len, num_features) dataset for sequence models.
+
+    For each i >= seq_len-1, we create:
+        X_seq[i] = X[i-seq_len+1 : i+1]   (uses history up to day i)
+        y_seq[i] = y[i]                   (target: next-day return after day i)
+
+    dates_seq[i] = dates[i]
+    """
+    assert len(X) == len(y) == len(dates)
+
+    X_seqs = []
+    y_seqs = []
+    date_seqs = []
+
+    for i in range(seq_len - 1, len(X)):
+        X_seqs.append(X[i - seq_len + 1 : i + 1])
+        y_seqs.append(y[i])
+        date_seqs.append(dates[i])
+
+    X_seqs = np.stack(X_seqs).astype(np.float32)
+    y_seqs = np.array(y_seqs, dtype=np.float32)
+    date_seqs = pd.Index(date_seqs)
+
+    return X_seqs, y_seqs, date_seqs
+
 
 # Default set of features / signals we use
 DEFAULT_FEATURES = [
