@@ -1,0 +1,24 @@
+{
+  "tree": {
+    "max_depth": 2,
+    "max_iter": 439,
+    "learning_rate": 0.11642187890123273,
+    "l2_regularization": 0.04920068484541007,
+    "q": 0.7623967197872421
+  },
+  "lstm_reg": {
+    "hidden_dim": 21,
+    "num_layers": 1,
+    "lr": 0.000157379314257067,
+    "batch_size": 32,
+    "num_epochs": 27,
+    "q": 0.6134720360345727
+  },
+  "lstm_cls": {
+    "hidden_dim": 41,
+    "num_layers": 1,
+    "lr": 0.003639497467330408,
+    "batch_size": 32,
+    "num_epochs": 23
+  }
+}

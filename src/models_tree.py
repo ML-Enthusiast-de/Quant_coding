@@ -1,21 +1,25 @@
 # src/models_tree.py
-import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error
-
+import numpy as np
 
 def train_tree_regressor(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-) -> HistGradientBoostingRegressor:
+    X_train,
+    y_train,
+    max_depth: int = 3,
+    max_iter: int = 300,
+    learning_rate: float = 0.05,
+    l2_regularization: float = 0.0,
+):
     """
-    Simple boosted tree baseline that predicts next-day returns.
+    Train a HistGradientBoostingRegressor.
+    Defaults reproduce your previous baseline.
     """
     model = HistGradientBoostingRegressor(
-        max_depth=3,
-        max_iter=300,
-        learning_rate=0.05,
-        l2_regularization=0.0,
+        max_depth=max_depth,
+        max_iter=max_iter,
+        learning_rate=learning_rate,
+        l2_regularization=l2_regularization,
     )
     model.fit(X_train, y_train)
     return model
