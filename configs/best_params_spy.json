@@ -1,24 +1,33 @@
 {
   "tree": {
-    "max_depth": 2,
-    "max_iter": 314,
-    "learning_rate": 0.040085117048811694,
-    "l2_regularization": 0.3307294927058205,
-    "q": 0.765931956446458
+    "max_depth": 4,
+    "max_iter": 212,
+    "learning_rate": 0.010953585620510933,
+    "l2_regularization": 0.06305942765614436,
+    "q": 0.4020856176117329
   },
   "lstm_reg": {
-    "hidden_dim": 42,
-    "num_layers": 2,
-    "lr": 0.0004536509928714577,
-    "batch_size": 32,
-    "num_epochs": 29,
-    "q": 0.5211498558296479
+    "hidden_dim": 20,
+    "num_layers": 9,
+    "lr": 0.00012129023015230723,
+    "batch_size": 128,
+    "num_epochs": 39,
+    "q": 0.7733450179109764
   },
   "lstm_cls": {
-    "hidden_dim": 46,
-    "num_layers": 8,
-    "lr": 0.002566640419918069,
+    "hidden_dim": 43,
+    "num_layers": 6,
+    "lr": 0.00018369404503142876,
     "batch_size": 128,
-    "num_epochs": 30
+    "num_epochs": 33
+  },
+  "tcn_reg": {
+    "hidden_dim": 30,
+    "num_layers": 2,
+    "kernel_size": 4,
+    "lr": 0.00423814170498586,
+    "batch_size": 32,
+    "num_epochs": 33,
+    "q": 0.6213805158607504
   }
 }
