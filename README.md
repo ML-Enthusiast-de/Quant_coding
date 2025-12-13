@@ -3,9 +3,9 @@
 This repo is my personal sandbox for **quantitative trading research** in Python.  
 I focus on a single liquid instrument (SPY) and build an end-to-end pipeline:
 
-> data → signal engineering → ML models → backtests → risk/return metrics
+> data → signal engineering → ML models → backtests → risk/return metrics → paper-trade signals
 
-The main goal is *research & learning*, not production trading.
+The main goal is **research & learning**, *not* production trading or financial advice.
 
 ---
 
@@ -22,41 +22,64 @@ The main goal is *research & learning*, not production trading.
   - calendar feature: day-of-week (`dow`)
 - Targets are **next-day returns** (`target_ret_1`).
 
-### Models
+---
 
-All models are trained on a **chronological train/test split** with an inner
-train/validation split for hyperparameter tuning via **Optuna**.
+## Models
+
+All models are trained on a **chronological train/test split**.  
+Inside the training window, I use an inner train/validation split and **Optuna** for hyperparameter tuning.
 
 - `src/models_tree.py`  
-  - Tree-based regressor (`HistGradientBoostingRegressor`)  
-  - Tuned on validation Sharpe, with a **quantile-based trading threshold**.
+  - Tree-based regressor (`HistGradientBoostingRegressor`).  
+  - Tuned on **validation Sharpe**, including a **quantile `q`** that controls when the strategy is long (ranking-based threshold).
 
 - `src/models_lstm.py`  
   - LSTM **regressor** (PyTorch) on sequences of signals.  
-  - Used with a **ranking strategy**: long only on top-q predicted returns.
+  - Trained on next-day returns, then used with a **ranking strategy**:
+    - compute predicted returns,
+    - go long only on the top-`q` fraction of days (Sharpe-tuned via Optuna).
 
 - `src/models_lstm_class.py`  
   - LSTM **classifier** for next-day direction (up/down).  
-  - Mostly serves as a negative result: shows how a complex model can collapse
-    to “always up” when the signal is weak.
+  - Tuned on validation **log-loss**.  
+  - Mostly serves as a negative/control result: demonstrates how a complex model can still collapse to “always up” on weak directional signal.
 
-### Backtesting & Metrics
+- `src/models_tcn.py`  
+  - TCN **regressor** (Temporal Convolutional Network, PyTorch) on sequences.  
+  - Uses causal, dilated 1D convolutions with residual blocks.  
+  - Same ranking-style trading rule as the LSTM regressor (long on top-`q` predicted returns), with `q` and model hyperparameters tuned on validation **Sharpe**.
+
+---
+
+## Backtesting & Metrics
 
 Backtesting utilities live in `src/backtest.py`:
 
 - Equity curves for:
   - Buy & Hold (SPY)
-  - Tree strategy
-  - LSTM classifier strategy
-  - LSTM regressor strategy
-- Metrics:
+  - Tree strategy (Sharpe-tuned ranking)
+  - LSTM classifier strategy (directional, prob threshold)
+  - LSTM regressor strategy (ranking)
+  - TCN regressor strategy (ranking)
+- Metrics per strategy:
   - CAGR
   - annualized volatility
   - Sharpe ratio
   - max drawdown
-  - (plus simple stats like fraction of days in the market, number of trades)
+  - fraction of days in the market (long ratio)
+  - number of trades (position changes)
 
-Main experiments and plots are in the notebooks (e.g. `03_*.ipynb`).
+At the end of the main notebook I build a small **performance report table** summarizing these metrics for all strategies side by side, plus a summary of the **best Optuna hyperparameters** and validation objectives for each model (tree, LSTM reg, TCN reg, LSTM cls).
+
+There is also a final “**trade_tomorrow**” section that:
+
+- takes the latest available 30-day history,
+- runs all trained models (tree, LSTM cls, LSTM reg, TCN reg),
+- and prints a **paper-trade signal** for the *next* bar (`LONG` / `FLAT`), along with each model’s score and threshold.
+
+> These signals are for **research only**, ignore costs/slippage, and are **not financial advice**.
+
+Main experiments, comparisons, and plots live in the notebooks (e.g. `03_*.ipynb`).
 
 ---
 
@@ -64,17 +87,18 @@ Main experiments and plots are in the notebooks (e.g. `03_*.ipynb`).
 
 ```text
 src/
-  data_loading.py      # yfinance download + CSV cache
-  signals.py           # feature engineering & targets
-  models_tree.py       # tree regressor + evaluation helpers
-  models_lstm.py       # LSTM regressor
-  models_lstm_class.py # LSTM classifier
-  backtest.py          # equity curves & metrics
+  data_loading.py       # yfinance download + CSV cache
+  signals.py            # feature engineering & targets
+  models_tree.py        # tree regressor + evaluation helpers
+  models_lstm.py        # LSTM regressor (sequence model)
+  models_lstm_class.py  # LSTM classifier (directional baseline)
+  models_tcn.py         # TCN regressor (temporal convolutional network)
+  backtest.py           # equity curves & risk/return metrics
 
 notebooks/
-  01_*.ipynb           # basic data + signals exploration
-  02_*.ipynb           # tree baseline & backtests
-  03_*.ipynb           # LSTM models, Optuna tuning, comparisons
+  01_*.ipynb            # basic data + signals exploration
+  02_*.ipynb            # tree baseline & first backtests
+  03_*.ipynb            # LSTM & TCN models, Optuna tuning, comparisons, reports
 
 configs/
-  best_params_spy.json # Optuna best hyperparameters for each model
+  best_params_spy.json  # Optuna best hyperparameters (tree, LSTM reg, LSTM cls, TCN reg)
