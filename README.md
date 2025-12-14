@@ -71,11 +71,6 @@ Backtesting utilities live in `src/backtest.py`:
 
 At the end of the main notebook I build a small **performance report table** summarizing these metrics for all strategies side by side, plus a summary of the **best Optuna hyperparameters** and validation objectives for each model (tree, LSTM reg, TCN reg, LSTM cls).
 
-There is also a final “**trade_tomorrow**” section that:
-
-- takes the latest available 30-day history,
-- runs all trained models (tree, LSTM cls, LSTM reg, TCN reg),
-- and prints a **paper-trade signal** for the *next* bar (`LONG` / `FLAT`), along with each model’s score and threshold.
 
 > These signals are for **research only**, ignore costs/slippage, and are **not financial advice**.
 
