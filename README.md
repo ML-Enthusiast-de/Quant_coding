@@ -111,25 +111,49 @@ Defined in `src/signals_cross.py` as a MultiIndex panel `(date, symbol)`:
 - moving-average gaps & simple regime flags
 - **forward 21-day return** as target: `target_fwd_21`
 
-Flattened to `X, y, dates, tickers` via `build_cross_sectional_matrix`.
+Flattened to `X, y, dates, tickers` via `build_cross_sectional_matrix`, which is used as input to the ML rankers.
 
-### Baseline Strategy
+### Baseline & Tree Ranker (with costs)
 
-In `notebooks/04_cross_sectional_sp500.ipynb`:
+Main notebooks:
 
-- Build a **time-based train / val / test split** on dates.
-- Implement a classic **cross-sectional momentum** baseline on the test set:
-  - each date, rank stocks by past 21-day return (`ret_21`),
-  - long-only: equal-weight top decile,
-  - long-short: long top decile, short bottom decile,
-  - benchmark: equal-weight all stocks.
-- Convert 21-day forward returns to daily-equivalent and feed them into the same backtest helpers as in the SPY project.
-- Evaluate EW vs momentum L / momentum L-S with:
-  - CAGR, volatility, Sharpe, max drawdown.
+- `notebooks/04_cross_sectional_sp500.ipynb`
+  - Build a **time-based train / val / test split** on dates.
+  - Implement classic **cross-sectional momentum**:
+    - each date, rank stocks by past 21-day return (`ret_21`),
+    - long-only: equal-weight top decile,
+    - long-short: long top decile, short bottom decile,
+    - benchmark: equal-weight all stocks.
+  - Convert 21-day forward returns to daily-equivalent and evaluate with:
+    - CAGR, volatility, Sharpe, max drawdown.
 
-Next steps (planned):
+- `notebooks/05_sp500_cs_tree_robustness.ipynb`
+  - Add a **cross-sectional HistGradientBoostingRegressor** that uses the full feature set to predict 21-day forward returns.
+  - Use **Optuna** to tune both:
+    - tree hyperparameters (depth, learning rate, iterations, leaf size),
+    - the trading quantile `q` (size of the long/short buckets),
+    - optimizing **validation long-short Sharpe**, with data strictly before the test window.
+  - Include simple **transaction-cost modeling**:
+    - per-21-day **round-trip cost** (e.g. 10 bps) applied to both momentum and tree portfolios,
+    - report **net-of-cost** returns and Sharpe.
+  - Run the full train/val/tune/test procedure across multiple non-overlapping test windows (e.g. 2005–2009, 2010–2014, …) to check **robustness over regimes**.
+  - Summarize per-window metrics:
+    - momentum vs tree, long-only and long-short,
+    - Sharpe differences (`tree – momentum`) to see where the ML ranker consistently adds value.
 
-- add a **cross-sectional tree / ML ranker** that takes all signals as input and competes against the naive momentum baseline.
+### Paper-Trade / Live Inference
+
+- A lightweight **inference script** (e.g. `scripts/sp500_cs_live_inference.py`) that:
+  - loads the saved cross-sectional tree model and its config (lookahead, `q_live`, cost assumptions),
+  - pulls the latest S&P 500 prices,
+  - rebuilds only the **most recent feature panel** (no need to reprocess the full history),
+  - computes predicted 21-day forward returns,
+  - applies the **net-of-cost** ranking rule and prints:
+    - top *N* tickers to **long**,
+    - bottom *N* tickers to **short**,
+    - with an estimated daily edge vs. equal-weight benchmark.
+
+This “paper trading” mode is meant for **offline experimentation only**, not live trading.
 
 ---
 
@@ -137,31 +161,39 @@ Next steps (planned):
 
 ```text
 data/
-  SPY.csv                 # SPY daily prices (yfinance cache)
-  sp500_symbols.csv       # S&P 500 universe
-  sp500_adj_close.parquet # S&P 500 adj close panel
+  SPY.csv                     # SPY daily prices (yfinance cache)
+  sp500_symbols.csv           # S&P 500 universe
+  sp500_adj_close.parquet     # S&P 500 adj close panel
 
 notebooks/
-  01_download_and_explore.ipynb      # basic SPY data + signals exploration
-  02_SPY_tree_baseline.ipynb         # SPY tree baseline & backtests
-  03_SPY_lstm_tree_tcn_transformer.ipynb  # SPY sequence models (LSTM/TCN/Transformer)
-  04_cross_sectional_sp500.ipynb     # S&P 500 cross-sectional momentum & panel prep
+  01_download_and_explore.ipynb             # basic SPY data + signals exploration
+  02_SPY_tree_baseline.ipynb                # SPY tree baseline & backtests
+  03_SPY_lstm_tree_tcn_transformer.ipynb    # SPY sequence models (LSTM/TCN/Transformer)
+  04_cross_sectional_sp500.ipynb            # S&P 500 cross-sectional momentum & panel prep
+  05_sp500_cs_tree_robustness.ipynb         # S&P 500 tree vs momentum, robustness + costs
 
 src/
   __init__.py
-  data_loading.py        # SPY yfinance download + CSV cache
-  data_loading_cross.py  # S&P 500 universe & panel download
-  signals.py             # SPY feature engineering & targets
-  signals_cross.py       # cross-sectional S&P 500 signals & targets
-  models_tree.py         # tree regressor + helpers (SPY)
-  models_lstm.py         # LSTM regressor (SPY sequence)
-  models_lstm_class.py   # LSTM classifier (SPY direction baseline)
-  models_tcn.py          # TCN regressor (SPY sequence)
-  models_transformer.py  # Transformer regressor (SPY sequence)
-  backtest.py            # equity curves & risk/return metrics
+  data_loading.py           # SPY yfinance download + CSV cache
+  data_loading_cross.py     # S&P 500 universe & panel download
+  signals.py                # SPY feature engineering & targets
+  signals_cross.py          # cross-sectional S&P 500 signals & targets
+  models_tree.py            # tree regressor + helpers (SPY)
+  models_lstm.py            # LSTM regressor (SPY sequence)
+  models_lstm_class.py      # LSTM classifier (SPY direction baseline)
+  models_tcn.py             # TCN regressor (SPY sequence)
+  models_transformer.py     # Transformer regressor (SPY sequence)
+  backtest.py               # equity curves & risk/return metrics
+
+scripts/
+  sp500_cs_live_inference.py  # load saved cross-sectional tree + config, output top-N long/short (paper-trade)
 
 configs/
-  best_params_spy.json   # Optuna best hyperparameters (tree, LSTM reg, LSTM cls, TCN, Transformer)
+  best_params_spy.json        # Optuna best hyperparameters (tree, LSTM reg, LSTM cls, TCN, Transformer)
+  sp500_cs_tree_live.json     # config for S&P 500 live cross-sectional tree (lookahead, q_live, costs, etc.)
+
+models/
+  sp500_cs_tree_live.joblib   # serialized S&P 500 cross-sectional tree model
 
 README.md
 requirements.txt
