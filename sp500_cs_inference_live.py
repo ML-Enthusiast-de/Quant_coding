@@ -8,6 +8,7 @@ Inference script: SP500 cross-sectional tree model (21d horizon)
 - Downloads / loads recent SP500 prices
 - Builds features for the LAST date only
 - Outputs top N tickers to LONG and bottom N to SHORT (net of costs)
+- Logs full-universe predictions + side/rank to parquet
 """
 
 import os
@@ -26,12 +27,81 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.data_loading_cross import load_sp500_adj_close
-from src.signals_cross import CROSS_FEATURES  # we reuse the same feature list
+from src.signals_cross import CROSS_FEATURES  # (optional) kept for reference / consistency
+
+
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+LOG_PATH = Path(PROJECT_ROOT) / "data" / "paper_trade" / "sp500_cs_predictions.parquet"
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def log_predictions(
+    as_of_date: pd.Timestamp,
+    df_long: pd.DataFrame,
+    df_short: pd.DataFrame,
+    df_all: pd.DataFrame,
+    config: dict,
+    log_path: Path = LOG_PATH,
+) -> None:
+    """
+    df_long, df_short: subsets of df_all, indexed by ticker
+    df_all: full-universe predictions, indexed by ticker, must contain:
+        [pred_fwd_21, pred_fwd_21_net, pred_daily_net, edge_vs_eqw_daily]
+    config: dict with model_name, model_version, lookahead, q_live, cost_bps, etc.
+    """
+
+    required_cols = {"pred_fwd_21", "pred_fwd_21_net", "pred_daily_net", "edge_vs_eqw_daily"}
+    missing = required_cols - set(df_all.columns)
+    if missing:
+        raise ValueError(f"log_predictions: df_all missing columns: {sorted(missing)}")
+
+    # ranks over full universe (1 = best)
+    rank = df_all["pred_daily_net"].rank(ascending=False, method="first")
+    df_all = df_all.assign(rank=rank)
+
+    # side = long/short/flat based on membership
+    side = pd.Series("flat", index=df_all.index, dtype="object")
+    side.loc[df_long.index] = "long"
+    side.loc[df_short.index] = "short"
+
+    log_df = pd.DataFrame(
+        {
+            "as_of_date": as_of_date,
+            "ticker": df_all.index,
+            "lookahead": config["lookahead"],
+            "side": side.values,
+            "rank": df_all["rank"].values,
+            "pred_fwd_21": df_all["pred_fwd_21"].values,
+            "pred_fwd_21_net": df_all["pred_fwd_21_net"].values,
+            "pred_daily_net": df_all["pred_daily_net"].values,
+            "edge_vs_eqw_daily": df_all["edge_vs_eqw_daily"].values,
+            "model_name": config.get("model_name", "sp500_tree_cs_21d"),
+            "model_version": config.get("model_version", "unknown"),
+            "q_live": config.get("q_live", np.nan),
+            "cost_bps": config.get("cost_bps", np.nan),
+            "train_start": config.get("train_start", None),
+            "train_end": config.get("train_end", None),
+        }
+    )
+
+    # append (or create) parquet log, de-dup on (as_of_date, ticker, model_version)
+    if log_path.exists():
+        old = pd.read_parquet(log_path)
+        key_cols = ["as_of_date", "ticker", "model_version"]
+        old_idx = old.set_index(key_cols).index
+        new_idx = log_df.set_index(key_cols).index
+        old = old[~old_idx.isin(new_idx)]
+        combined = pd.concat([old, log_df], ignore_index=True)
+    else:
+        combined = log_df
+
+    combined.to_parquet(log_path)
+    print(f"Logged {len(log_df)} predictions to {log_path}")
 
 
 # ---------------------------------------------------------------------
 # Helper: build features for the last date only
-# (must be consistent with what you used in training)
 # ---------------------------------------------------------------------
 def build_live_feature_matrix(
     prices: pd.DataFrame,
@@ -106,8 +176,7 @@ def build_live_feature_matrix(
 
     # --- Calendar feature: day-of-week ---
     if "dow" in feature_names:
-        dow_val = last_date.dayofweek  # 0=Mon, ..., 4=Fri
-        feats["dow"] = float(dow_val)
+        feats["dow"] = float(last_date.dayofweek)  # 0=Mon, ..., 4=Fri
 
     # Keep only the columns the model expects, in the right order
     feats = feats[feature_names]
@@ -127,13 +196,14 @@ def run_inference(
     n_short: int = 20,
     price_start: str = "2015-01-01",
     force_download: bool = False,
+    do_log: bool = True,
 ):
     """
-    Load model bundle and produce 20 long / 20 short picks for the last date.
+    Load model bundle and produce long/short picks for the last date.
 
     price_start:
-        Earliest date to load prices from. We don't need full history;
-        we just need enough to compute moving averages (up to 200d) and 21d returns.
+        Earliest date to load prices from. We just need enough to compute moving averages
+        (up to 200d) and lookahead returns.
     """
     if model_path is None:
         model_path = Path(PROJECT_ROOT) / "models" / "sp500_tree_cs_21d_live.pkl"
@@ -143,9 +213,9 @@ def run_inference(
 
     bundle = joblib.load(model_path)
     model = bundle["model"]
-    q_live = bundle["q_live"]   # not strictly needed for fixed 20/20, but nice to keep
-    lookahead = bundle["lookahead"]
-    cost_bps = bundle["cost_bps"]
+    q_live = bundle.get("q_live", np.nan)
+    lookahead = int(bundle["lookahead"])
+    cost_bps = float(bundle["cost_bps"])  # expected to be decimal (e.g. 0.001 = 10 bps)
     feature_names = bundle["features"]
 
     # --- Load recent price data ---
@@ -158,51 +228,48 @@ def run_inference(
 
     # --- Build features for last date ---
     as_of_date, X_live_df = build_live_feature_matrix(prices, feature_names)
-
     if X_live_df.empty:
         raise RuntimeError("No valid tickers after feature construction (all NaNs?).")
 
     tickers_live = X_live_df.index.to_numpy()
     X_live = X_live_df.values
 
-    # --- Model predictions: 21d forward returns ---
-    pred_fwd_21 = model.predict(X_live)
+    # --- Model predictions: forward returns over lookahead ---
+    pred_fwd = model.predict(X_live)
 
-    # Apply long-only transaction cost assumption for the horizon
-    pred_fwd_21_net = (1.0 + pred_fwd_21) * (1.0 - cost_bps) - 1.0
+    # Apply round-trip transaction cost assumption for the horizon
+    pred_fwd_net = (1.0 + pred_fwd) * (1.0 - cost_bps) - 1.0
 
-    # Convert to *daily* net return for comparability
-    pred_daily_net = (1.0 + pred_fwd_21_net) ** (1.0 / lookahead) - 1.0
+    # Convert to daily net return for comparability
+    pred_daily_net = (1.0 + pred_fwd_net) ** (1.0 / lookahead) - 1.0
 
-    # Equal-weight baseline of model predictions (as a rough "index" prediction)
-    eqw_fwd_21 = float(pred_fwd_21.mean())
-    eqw_fwd_21_net = (1.0 + eqw_fwd_21) * (1.0 - cost_bps) - 1.0
-    eqw_daily = (1.0 + eqw_fwd_21_net) ** (1.0 / lookahead) - 1.0
+    # Equal-weight baseline over predicted universe
+    eqw_fwd = float(np.mean(pred_fwd))
+    eqw_fwd_net = (1.0 + eqw_fwd) * (1.0 - cost_bps) - 1.0
+    eqw_daily = (1.0 + eqw_fwd_net) ** (1.0 / lookahead) - 1.0
 
     edge_vs_eqw = pred_daily_net - eqw_daily
 
     df_out = pd.DataFrame(
         {
             "ticker": tickers_live,
-            "pred_fwd_21": pred_fwd_21,
-            "pred_fwd_21_net": pred_fwd_21_net,
+            "pred_fwd_21": pred_fwd,
+            "pred_fwd_21_net": pred_fwd_net,
             "pred_daily_net": pred_daily_net,
             "edge_vs_eqw_daily": edge_vs_eqw,
         }
     ).set_index("ticker")
 
-    # Sort by predicted daily net return
     df_sorted = df_out.sort_values("pred_daily_net", ascending=False)
-
     top_long = df_sorted.head(n_long).copy()
     top_short = df_sorted.tail(n_short).sort_values("pred_daily_net", ascending=True).copy()
 
     # --- Pretty print ---
     print("=" * 80)
     print(f"Paper-trade recommendations as of {as_of_date.date()}  |  horizon: {lookahead} days")
-    print(f"Model trained on: {bundle['train_start']} – {bundle['train_end']}")
-    print(f"Hyperparams (Optuna): {bundle['optuna_best_params']}")
-    print(f"q_live (typical fraction long/short): {q_live:.3f}")
+    print(f"Model trained on: {bundle.get('train_start', 'unknown')} – {bundle.get('train_end', 'unknown')}")
+    print(f"Hyperparams (Optuna): {bundle.get('optuna_best_params', {})}")
+    print(f"q_live (typical fraction long/short): {q_live}")
     print(f"Assumed round-trip cost per horizon: {cost_bps * 1e4:.1f} bps")
     print(f"Equal-weight baseline (predicted daily net): {eqw_daily:.6f}")
     print("=" * 80)
@@ -216,6 +283,19 @@ def run_inference(
     print(top_short.round(6))
     print()
 
+    # --- Log predictions ---
+    if do_log:
+        config = {
+            "model_name": bundle.get("model_name", "sp500_tree_cs_21d"),
+            "model_version": bundle.get("model_version", model_path.stem),
+            "lookahead": lookahead,
+            "q_live": q_live,
+            "cost_bps": cost_bps,
+            "train_start": bundle.get("train_start", None),
+            "train_end": bundle.get("train_end", None),
+        }
+        log_predictions(as_of_date, top_long, top_short, df_sorted, config)
+
     return {
         "as_of_date": as_of_date,
         "eqw_daily_net": eqw_daily,
@@ -226,5 +306,4 @@ def run_inference(
 
 
 if __name__ == "__main__":
-    # Typical usage: python sp500_cs_inference_live.py
     run_inference()
