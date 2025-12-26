@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# personal portfolio
+data/portfolio/current_portfolio.csv
+data/*
+!data/sp500_symbols.csv
