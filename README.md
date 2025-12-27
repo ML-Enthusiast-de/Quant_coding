@@ -1,11 +1,16 @@
+> 🚨 **DISCLAIMER – RESEARCH ONLY, NOT FINANCIAL ADVICE** 🚨  
+> This repository is strictly for **research and educational purposes**.  
+> It is **not** investment advice, does **not** constitute a trading system, and is **not** intended for live trading with real money.  
+> Use at your own risk.
+
 # QuantCoding – ML Trading Experiments (SPY & S&P 500)
 
 This repo is my personal sandbox for **quantitative trading research** in Python.
 
 There are currently two main “tracks”:
 
-1. **Single-asset time-series** on SPY (daily data, sequence models)
-2. **Cross-sectional S&P 500** stock-picking (panel data, momentum baseline → ML rankers)
+1. **Single-asset time-series** on SPY (daily data, sequence models)  
+2. **Cross-sectional S&P 500** stock-picking (panel data, momentum baseline → ML rankers + portfolio helper)
 
 Pipeline in both cases:
 
@@ -77,15 +82,11 @@ Backtesting utilities live in `src/backtest.py`:
   - fraction of days in the market (long ratio)
   - number of trades (position changes)
 
-The main SPY experiments, comparisons, and plots live in:
+Main SPY notebooks:
 
 - `notebooks/01_download_and_explore.ipynb`
 - `notebooks/02_SPY_tree_baseline.ipynb`
 - `notebooks/03_SPY_lstm_tree_tcn_transformer.ipynb`
-
-At the end of the SPY notebook I build a small **performance report table** summarizing these metrics for all strategies side by side, plus a summary of the **best Optuna hyperparameters** and validation objectives.
-
-> These signals ignore transaction costs/slippage and are for **research only** – not financial advice.
 
 ---
 
@@ -94,7 +95,7 @@ At the end of the SPY notebook I build a small **performance report table** summ
 ### Data & Universe
 
 - S&P 500 constituents scraped from Slickcharts and stored in:
-  - `data/sp500_symbols.csv` (column: `symbol`)
+  - `data/sp500_symbols.csv` (columns incl. `symbol`, optionally `sector`)
 - Adjusted close prices for the full S&P 500 universe:
   - downloaded in batches via `yfinance` and cached as  
     `data/sp500_adj_close.parquet`
@@ -104,96 +105,145 @@ At the end of the SPY notebook I build a small **performance report table** summ
 
 ### Cross-Sectional Signals
 
-Defined in `src/signals_cross.py` as a MultiIndex panel `(date, symbol)`:
+Defined in `src/signals_cross.py` as a MultiIndex panel `(date, ticker)`:
 
 - past returns: `ret_1`, `ret_5`, `ret_21`, etc.
 - volatility & simple risk measures
 - moving-average gaps & simple regime flags
 - **forward 21-day return** as target: `target_fwd_21`
+- optional `sector` column (from `sp500_symbols.csv`) for **sector-neutral** experiments
 
 Flattened to `X, y, dates, tickers` via `build_cross_sectional_matrix`, which is used as input to the ML rankers.
 
-### Baseline & Tree Ranker (with costs)
+### Baseline: Cross-Sectional Momentum
 
-Main notebooks:
+`notebooks/04_cross_sectional_sp500.ipynb`:
 
-- `notebooks/04_cross_sectional_sp500.ipynb`
-  - Build a **time-based train / val / test split** on dates.
-  - Implement classic **cross-sectional momentum**:
-    - each date, rank stocks by past 21-day return (`ret_21`),
-    - long-only: equal-weight top decile,
-    - long-short: long top decile, short bottom decile,
-    - benchmark: equal-weight all stocks.
-  - Convert 21-day forward returns to daily-equivalent and evaluate with:
-    - CAGR, volatility, Sharpe, max drawdown.
+- Build a **time-based train / val / test split** on dates.
+- Implement classic **cross-sectional momentum**:
+  - each date, rank stocks by past 21-day return (`ret_21`),
+  - long-only: equal-weight top decile,
+  - long-short: long top decile, short bottom decile,
+  - benchmark: equal-weight all stocks.
+- Convert 21-day forward returns to daily-equivalent and evaluate with:
+  - CAGR, volatility, Sharpe, max drawdown.
 
-- `notebooks/05_sp500_cs_tree_robustness.ipynb`
-  - Add a **cross-sectional HistGradientBoostingRegressor** that uses the full feature set to predict 21-day forward returns.
-  - Use **Optuna** to tune both:
-    - tree hyperparameters (depth, learning rate, iterations, leaf size),
-    - the trading quantile `q` (size of the long/short buckets),
-    - optimizing **validation long-short Sharpe**, with data strictly before the test window.
-  - Include simple **transaction-cost modeling**:
-    - per-21-day **round-trip cost** (e.g. 10 bps) applied to both momentum and tree portfolios,
-    - report **net-of-cost** returns and Sharpe.
-  - Run the full train/val/tune/test procedure across multiple non-overlapping test windows (e.g. 2005–2009, 2010–2014, …) to check **robustness over regimes**.
-  - Summarize per-window metrics:
-    - momentum vs tree, long-only and long-short,
-    - Sharpe differences (`tree – momentum`) to see where the ML ranker consistently adds value.
+### Tree & XGB Rankers + Robustness (with costs)
 
-### Paper-Trade / Live Inference
+`notebooks/05_sp500_cs_tree_robustness.ipynb`:
 
-- A lightweight **inference script** (e.g. `scripts/sp500_cs_live_inference.py`) that:
-  - loads the saved cross-sectional tree model and its config (lookahead, `q_live`, cost assumptions),
-  - pulls the latest S&P 500 prices,
-  - rebuilds only the **most recent feature panel** (no need to reprocess the full history),
-  - computes predicted 21-day forward returns,
-  - applies the **net-of-cost** ranking rule and prints:
-    - top *N* tickers to **long**,
-    - bottom *N* tickers to **short**,
-    - with an estimated daily edge vs. equal-weight benchmark.
+- Add **cross-sectional ML rankers** that use the full feature set to predict 21-day forward returns:
+  - `HistGradientBoostingRegressor` (tree),
+  - `XGBRegressor` (XGBoost).
+- For each test window:
+  - build train/validation sets using only data *before* the test period,
+  - use **Optuna** to tune:
+    - model hyperparameters (depth, learning rate, iterations, etc.),
+    - the trading quantile `q` (size of long/short buckets),
+    - optimizing **validation long-short Sharpe (net of costs)**.
+- Include simple **transaction-cost modeling**:
+  - per-21-day **round-trip cost** (e.g. 10 bps) applied to both momentum and ML portfolios,
+  - report **net-of-cost** returns and Sharpe.
+- Evaluate across multiple non-overlapping test windows (e.g. 2005–2009, 2010–2014, 2015–2019, 2020–2024) to check **regime robustness**.
+- Report per-window metrics:
+  - momentum vs tree vs XGB, long-only and long-short,
+  - Sharpe differences (`tree – momentum`, `xgb – momentum`),
+  - optional **sector-neutral** variants when sector data is available.
 
-This “paper trading” mode is meant for **offline experimentation only**, not live trading.
+At the end of `05_sp500_cs_tree_robustness.ipynb`, a final **cross-sectional tree model** is tuned on a global train/validation split and trained once on all historical data.  
+This model is saved as a bundle:
+
+- `models/sp500_tree_cs_21d_live.pkl`
+
+including:
+
+- the trained `HistGradientBoostingRegressor`
+- the feature list (`CROSS_FEATURES`)
+- lookahead horizon
+- cost assumptions
+- tuned live quantile `q_live`
+- basic training metadata
 
 ---
 
-## Repo Structure (simplified)
+## 3. Paper-Trade / Live Inference
 
-```text
-data/
-  SPY.csv                     # SPY daily prices (yfinance cache)
-  sp500_symbols.csv           # S&P 500 universe
-  sp500_adj_close.parquet     # S&P 500 adj close panel
+The **live inference** entry point for the cross-sectional model is:
 
-notebooks/
-  01_download_and_explore.ipynb             # basic SPY data + signals exploration
-  02_SPY_tree_baseline.ipynb                # SPY tree baseline & backtests
-  03_SPY_lstm_tree_tcn_transformer.ipynb    # SPY sequence models (LSTM/TCN/Transformer)
-  04_cross_sectional_sp500.ipynb            # S&P 500 cross-sectional momentum & panel prep
-  05_sp500_cs_tree_robustness.ipynb         # S&P 500 tree vs momentum, robustness + costs
+- `scripts/sp500_cs_inference_live.py`
 
-src/
-  __init__.py
-  data_loading.py           # SPY yfinance download + CSV cache
-  data_loading_cross.py     # S&P 500 universe & panel download
-  signals.py                # SPY feature engineering & targets
-  signals_cross.py          # cross-sectional S&P 500 signals & targets
-  models_tree.py            # tree regressor + helpers (SPY)
-  models_lstm.py            # LSTM regressor (SPY sequence)
-  models_lstm_class.py      # LSTM classifier (SPY direction baseline)
-  models_tcn.py             # TCN regressor (SPY sequence)
-  models_transformer.py     # Transformer regressor (SPY sequence)
-  backtest.py               # equity curves & risk/return metrics
+What it does:
 
-scripts/
-  sp500_cs_live_inference.py  # load saved cross-sectional tree + config, output top-N long/short (paper-trade)
+1. **Load model bundle**
 
-configs/
-  best_params_spy.json        # Optuna best hyperparameters (tree, LSTM reg, LSTM cls, TCN, Transformer)
-  sp500_cs_tree_live.json     # config for S&P 500 live cross-sectional tree (lookahead, q_live, costs, etc.)
+   - Loads `models/sp500_tree_cs_21d_live.pkl`.
+   - Extracts model, `q_live`, `lookahead`, `cost_bps`, and expected feature names.
 
-models/
-  sp500_cs_tree_live.joblib   # serialized S&P 500 cross-sectional tree model
+2. **Fetch recent prices & build features for “today”**
 
-README.md
-requirements.txt
+   - Uses `load_sp500_adj_close` from `src/data_loading_cross.py`.
+   - Computes the required feature columns **only for the last date**.
+   - Drops tickers with insufficient history / NaNs.
+
+3. **Predict cross-sectional forward returns**
+
+   - Predicts **21-day forward returns** for each ticker (`pred_fwd_21`).
+   - Applies the configured **round-trip transaction cost** to get `pred_fwd_21_net`.
+   - Converts this to **daily net returns** (`pred_daily_net`).
+
+4. **Equal-weight benchmark & edges**
+
+   - Computes an **equal-weight benchmark** over the universe:
+
+     ```text
+     eqw_daily_net = model-implied average daily net return
+                     if you held all available stocks equally weighted
+                     over the horizon (after costs)
+     ```
+
+   - For each ticker, computes `edge_vs_eqw_daily = pred_daily_net - eqw_daily_net`.
+
+5. **Rank and output paper-trade signals**
+
+   - Sorts by `pred_daily_net` (descending).
+   - Outputs:
+     - top *N* tickers to **long**,
+     - bottom *N* tickers to **short**,
+     - plus predicted forward return, daily net return, and edge vs equal-weight.
+
+6. **Logging**
+
+   - Logs full-universe predictions to:
+
+     ```text
+     data/paper_trade/sp500_cs_predictions.parquet
+     ```
+
+   - Each row includes:
+     - `as_of_date`, `ticker`
+     - `side` (long / short / flat)
+     - `rank` (1 = best)
+     - `pred_fwd_21`, `pred_fwd_21_net`, `pred_daily_net`, `edge_vs_eqw_daily`
+     - model metadata (`model_name`, `model_version`, `q_live`, `cost_bps`, train period)
+
+Again: this is **paper trading only**, not a live execution system.
+
+---
+
+## 4. Experimental Portfolio Manager
+
+There is an experimental **portfolio manager** that sits on top of the live cross-sectional model and your own holdings:
+
+- Script: `scripts/portfolio_manager.py` (imports `run_inference` from `sp500_cs_inference_live.py`)
+- Portfolio file (user-owned, gitignored):  
+  `data/portfolio/current_portfolio.csv`
+
+### Portfolio CSV schema
+
+The portfolio manager expects a CSV like:
+
+```csv
+ticker,shares,cost_basis,current_price
+AAPL,15,190.50,228.30
+MSFT,10,310.00,476.12
+SPY,5,420.00,543.10
