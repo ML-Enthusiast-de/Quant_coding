@@ -1,0 +1,7 @@
+pandas
+websocket-client
+pyarrow
+pyyaml
+numpy
+scikit-learn
+xgboost

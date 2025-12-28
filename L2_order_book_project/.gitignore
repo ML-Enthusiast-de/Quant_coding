@@ -1,0 +1,16 @@
+# L2 order book project artifacts (keep repo lean)
+data/
+runs/
+models/
+logs/
+
+# common large / local outputs
+*.parquet
+*.sqlite
+*.jsonl
+*.csv
+*.npz
+
+# environment files
+.env
+.env.*

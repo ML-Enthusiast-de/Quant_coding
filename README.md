@@ -7,10 +7,11 @@
 
 This repo is my personal sandbox for **quantitative trading research** in Python.
 
-There are currently two main “tracks”:
+There are currently three main “tracks”:
 
 1. **Single-asset time-series** on SPY (daily data, sequence models)  
 2. **Cross-sectional S&P 500** stock-picking (panel data, momentum baseline → ML rankers + portfolio helper)
+3. **L2 Order Book Microstructure** → see L2_order_book_project/README.md
 
 Pipeline in both cases:
 
