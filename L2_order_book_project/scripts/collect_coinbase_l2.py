@@ -150,7 +150,7 @@ def print_collection_banner(raw_dir: Path) -> None:
 @dataclass
 class Config:
     product: str = "BTC-USD"
-    minutes: int = 30
+    minutes: int = 120
     out_format: str = "parquet"  # parquet|csv
     ws_url: str = "wss://advanced-trade-ws.coinbase.com"
     flush_rows: int = 20_000
@@ -191,7 +191,7 @@ def parse_message(msg: dict[str, Any]) -> dict[str, Any] | None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--product", type=str, default="BTC-USD")
-    ap.add_argument("--minutes", type=int, default=30)
+    ap.add_argument("--minutes", type=int, default=120)
     ap.add_argument("--format", type=str, default="parquet", choices=["parquet", "csv"])
     ap.add_argument("--flush-rows", type=int, default=20_000)
     ap.add_argument("--flush-seconds", type=int, default=300)
