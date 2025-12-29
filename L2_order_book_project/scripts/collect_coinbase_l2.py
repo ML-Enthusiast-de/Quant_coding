@@ -56,7 +56,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "L2_order_book_project" / "data" / "raw"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-# add near the top (imports)
 import json
 from collections import defaultdict
 
