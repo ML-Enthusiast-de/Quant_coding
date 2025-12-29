@@ -56,11 +56,101 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "L2_order_book_project" / "data" / "raw"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
+# add near the top (imports)
+import json
+from collections import defaultdict
+
+def _dir_size_bytes(path: Path) -> int:
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+def summarize_collected_data(raw_dir: Path) -> dict:
+    """
+    Summarize everything we've collected so far by reading manifest.json files.
+    Fast (no parquet reads).
+    """
+    manifests = sorted(raw_dir.glob("coinbase_l2_*/*manifest.json"))
+    per_product = defaultdict(lambda: {"runs": 0, "minutes": 0, "rows": 0, "parts": 0})
+
+    total = {"runs": 0, "minutes": 0, "rows": 0, "parts": 0}
+    missing_manifest_dirs = []
+
+    # also detect run directories without manifests (e.g. force-kill)
+    for run_dir in sorted(raw_dir.glob("coinbase_l2_*")):
+        if run_dir.is_dir() and not (run_dir / "manifest.json").exists():
+            # only count as "missing" if it has part files
+            has_parts = any(run_dir.glob("part_*.parquet")) or any(run_dir.glob("part_*.csv"))
+            if has_parts:
+                missing_manifest_dirs.append(run_dir)
+
+    for mpath in manifests:
+        try:
+            m = json.loads(mpath.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        product = m.get("product", "UNKNOWN")
+        runs = 1
+        minutes = int(m.get("minutes", 0) or 0)
+        rows = int(m.get("rows_written", 0) or 0)
+        parts = int(m.get("parts", 0) or 0)
+
+        per_product[product]["runs"] += runs
+        per_product[product]["minutes"] += minutes
+        per_product[product]["rows"] += rows
+        per_product[product]["parts"] += parts
+
+        total["runs"] += runs
+        total["minutes"] += minutes
+        total["rows"] += rows
+        total["parts"] += parts
+
+    total_hours = total["minutes"] / 60.0
+    total_size_gb = _dir_size_bytes(raw_dir) / (1024**3)
+
+    return {
+        "total": total,
+        "total_hours": total_hours,
+        "total_size_gb": total_size_gb,
+        "per_product": dict(per_product),
+        "missing_manifest_dirs": [str(p) for p in missing_manifest_dirs],
+        "manifest_count": len(manifests),
+    }
+
+def print_collection_banner(raw_dir: Path) -> None:
+    s = summarize_collected_data(raw_dir)
+    total = s["total"]
+
+    print("=" * 80)
+    print("COINBASE L2 DATABASE SUMMARY (local)")
+    print(f"Folder: {raw_dir}")
+    print(
+        f"Collected so far: {total['minutes']} min ({s['total_hours']:.2f} h) | "
+        f"runs={total['runs']} | parts={total['parts']} | rows={total['rows']:,} | "
+        f"disk={s['total_size_gb']:.3f} GB | manifests={s['manifest_count']}"
+    )
+
+    if s["per_product"]:
+        for product, d in sorted(s["per_product"].items()):
+            print(
+                f"  - {product}: {d['minutes']} min ({d['minutes']/60:.2f} h), "
+                f"runs={d['runs']}, parts={d['parts']}, rows={d['rows']:,}"
+            )
+
+    if s["missing_manifest_dirs"]:
+        print("WARNING: Found run dirs with data but missing manifest.json (likely force-kill):")
+        for p in s["missing_manifest_dirs"][:5]:
+            print(f"  - {p}")
+        if len(s["missing_manifest_dirs"]) > 5:
+            print(f"  ... and {len(s['missing_manifest_dirs']) - 5} more")
+
+    print("=" * 80)
+    print()
+
 
 @dataclass
 class Config:
     product: str = "BTC-USD"
-    minutes: int = 10
+    minutes: int = 30
     out_format: str = "parquet"  # parquet|csv
     ws_url: str = "wss://advanced-trade-ws.coinbase.com"
     flush_rows: int = 20_000
@@ -101,7 +191,7 @@ def parse_message(msg: dict[str, Any]) -> dict[str, Any] | None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--product", type=str, default="BTC-USD")
-    ap.add_argument("--minutes", type=int, default=10)
+    ap.add_argument("--minutes", type=int, default=30)
     ap.add_argument("--format", type=str, default="parquet", choices=["parquet", "csv"])
     ap.add_argument("--flush-rows", type=int, default=20_000)
     ap.add_argument("--flush-seconds", type=int, default=300)
@@ -129,6 +219,10 @@ def main():
 
     print(f"Connecting to {cfg.ws_url} for {cfg.minutes} min, product={cfg.product}")
     print(f"Writing batches to: {run_dir}")
+
+    print_collection_banner(RAW_DIR)
+
+    ap = argparse.ArgumentParser()
 
     # ----------------------------
     # Shutdown coordination
