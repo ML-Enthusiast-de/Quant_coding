@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -109,6 +110,17 @@ def _choose_row_ts(df: pd.DataFrame, prefer_exchange_ts: bool) -> pd.Series:
     return ex_ts.fillna(rx_ts) if prefer_exchange_ts else rx_ts.fillna(ex_ts)
 
 
+
+def _tob_same(prev: tuple[float, float, float, float], curr: tuple[float, float, float, float]) -> bool:
+    # price usually matches exactly; sizes may wobble, so allow tiny tolerance
+    return (
+        math.isclose(prev[0], curr[0], rel_tol=0.0, abs_tol=1e-12) and  # best_bid
+        math.isclose(prev[1], curr[1], rel_tol=0.0, abs_tol=1e-12) and  # best_ask
+        math.isclose(prev[2], curr[2], rel_tol=0.0, abs_tol=1e-12) and  # bid_sz
+        math.isclose(prev[3], curr[3], rel_tol=0.0, abs_tol=1e-12)      # ask_sz
+    )
+
+
 def list_run_dirs(product: str) -> list[Path]:
     """
     Return ALL run folders like:
@@ -189,6 +201,9 @@ def reconstruct_one_run(run_dir: Path, cfg: Config, segment_offset: int = 0) -> 
     segment_offset lets us make segment_ids unique across runs when combining.
     """
     parts = list_part_files(run_dir)
+
+    last_tob: tuple[float, float, float, float] | None = None
+
 
     book = L2Book()
     have_snapshot = False
@@ -274,19 +289,30 @@ def reconstruct_one_run(run_dir: Path, cfg: Config, segment_offset: int = 0) -> 
                 else 0.0
             )
 
+
+                # ---- CHANGE GUARD: only write if TOB changed ----
+            curr_tob = (float(bb), float(ba), float(bb_sz), float(ba_sz))
+
+            if last_tob is not None and _tob_same(last_tob, curr_tob):
+                continue  # no change -> skip writing a row
+
+            last_tob = curr_tob
+
             out_rows.append(
                 {
                     "ts": ts_msg,
                     "segment_id": segment_id,
-                    "best_bid": bb,
-                    "best_ask": ba,
-                    "bid_sz": bb_sz,
-                    "ask_sz": ba_sz,
+                    "best_bid": curr_tob[0],
+                    "best_ask": curr_tob[1],
+                    "bid_sz": curr_tob[2],
+                    "ask_sz": curr_tob[3],
                     "spread": spread,
                     "mid": mid,
                     "microprice": micro,
                     "imbalance_1": imb1,
                 }
+
+
             )
 
     if not out_rows:
