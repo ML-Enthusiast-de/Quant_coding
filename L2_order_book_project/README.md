@@ -1,67 +1,54 @@
-FOR RESEARCH / EDUCATIONAL PURPOSES ONLY — NOT FINANCIAL ADVICE.
-This repository contains experimental trading research code. Nothing here is production-grade, nothing is an offer/solicitation, and it may be wrong, incomplete, or misleading.
-Do not trade real money based on this code. Use at your own risk.
+# Track 3 — Crypto Order Book Microstructure (L2) — WIP
 
-Track 3 — Crypto Order Book Microstructure (WIP)
-Goal
+## ⚠️ Disclaimer (read first)
+**FOR RESEARCH / EDUCATIONAL PURPOSES ONLY — NOT FINANCIAL ADVICE.**
 
+This repository contains **experimental trading research code**. Nothing here is production-grade, nothing is an offer/solicitation, and it may be wrong, incomplete, or misleading.  
+**Do not trade real money based on this code. Use at your own risk.**
+
+---
+
+## Goal
 Build a full microstructure research pipeline based on real-time exchange market data:
 
-WebSocket data → normalized event stream → L2 book reconstruction → microstructure features → forward labels → predictive models → evaluation + (paper) execution simulation
+**WebSocket data → normalized event stream → L2 book reconstruction → microstructure features → forward labels → predictive models → evaluation + (paper) execution simulation**
 
-Why this matters
+---
 
+## Why this matters
+Microstructure research forces you to handle real-world trading-system constraints:
 
-event-driven systems
+- **Event-driven systems** (not bar-based)
+- **Latency + data quality issues**
+- **Stateful L2 book maintenance**
+- **Microstructure features** (imbalance, OFI, spreads, depth)
+- **Realistic evaluation** (slippage, fees, queueing assumptions)
 
-latency + data quality issues
+---
 
-stateful L2 book maintenance
+## What we compute (planned)
 
-microstructure features (imbalance, OFI, spreads, depth)
+### Book state / microstructure features
+- Best bid/ask, **spread**
+- **Midprice**, **microprice**
+- Depth at top **N levels**
+- **Imbalance** (top 1 / top k)
+- **Order Flow Imbalance (OFI)** variants
+- Short-horizon volatility proxies
+- Event intensity (updates/sec), burstiness
 
-realistic evaluation (slippage, fees, queueing assumptions)
+### Targets / labels
+- Future midprice move over horizon (**classification**)
+- Future return / microprice change (**regression**)
+- Triple-barrier style labels (optional)
 
+### Models
+- Baselines: **logistic regression**, **linear/ridge**, **tree models**
+- Lightweight neural baselines (**MLP / 1D conv**)
+- Strict time-split evaluation + **walk-forward**
 
-What we compute (planned)
-Book state / microstructure features
-
-best bid/ask, spread
-
-midprice, microprice
-
-depth at top N levels
-
-imbalance (top 1 / top k)
-
-order flow imbalance (OFI) variants
-
-short-horizon volatility proxies
-
-event intensity (updates/sec), burstiness
-
-Targets / labels (planned)
-
-future midprice move over horizon (classification)
-
-future return / microprice change (regression)
-
-triple-barrier style labels (optional)
-
-Models (planned)
-
-baselines: logistic regression, linear/ridge, tree models
-
-lightweight neural baselines (MLP / 1D conv)
-
-strict time-split evaluation + walk-forward
-
-Evaluation (planned)
-
-out-of-sample AUC / logloss, calibration
-
-information coefficient (IC)
-
-turnover + trade count constraints
-
-simple execution sim with fees + slippage assumptions
+### Evaluation
+- Out-of-sample AUC / logloss, calibration
+- **Information coefficient (IC)**
+- Turnover + trade count constraints
+- Simple execution sim with **fees + slippage assumptions**
