@@ -2,21 +2,19 @@
 """
 FOR RESEARCH / EDUCATIONAL PURPOSES ONLY — NOT FINANCIAL ADVICE.
 
-Option A (Evaluation Fix) — Focus: 600s horizon
+Option A (Evaluation Fix) — 600s horizon
 
-What this script does:
-- Loads tob_dataset_<slug>_<sample>_600s.parquet
-- Applies a PURGED / EMBARGOED strict time split:
-    * train/val/test are chronological
-    * BUT we drop the last embargo_seconds of train and val
-      to prevent label overlap leakage (forward label uses t+horizon)
-- Trains Ridge regression to predict y_ret_fwd_600s
-- Converts predictions into trades using a cost-aware threshold:
-    trade if |pred| > k * breakeven, direction = sign(pred)
-- Chooses k on VAL (with min trade count), reports TEST for:
-    (1) taker_realistic: fee=5 bps/side + spread cost
-    (2) maker_optimistic: fee=1 bp/side + no spread cost
-- Also reports an "oracle" bound using the true y_ret with the same threshold rule.
+Pipeline:
+- Load tob_dataset_<slug>_<sample>_600s.parquet
+- Chronological train/val/test split with purge/embargo on train+val tails
+  (prevents forward-label overlap across boundaries)
+- Fit Ridge on y_ret_fwd_600s
+- Turn preds into trades via a cost-aware threshold:
+    trade if |pred| > k * breakeven, dir = sign(pred)
+- Select k on VAL (min trade count), then report TEST for:
+    (1) taker_realistic: 5 bps/side + spread cost
+    (2) maker_optimistic: 1 bp/side + no spread cost
+- Also print an "oracle" bound using the true y_ret with the same threshold rule
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ from sklearn.linear_model import Ridge
 
 
 # -----------------------------------------------------------------------------
-# Make repo imports work reliably (repo root on sys.path)
+# Repo bootstrap: ensure repo root is on sys.path
 # -----------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]  # .../Quant_coding
 if str(REPO_ROOT) not in sys.path:
@@ -44,7 +42,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 # -----------------------------------------------------------------------------
-# CONFIG (edit these)
+# Config
 # -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Scenario:
@@ -59,11 +57,11 @@ class Config:
     sample: str = "1s"
     horizon: str = "600s"
 
-    # strict split fractions (chronological)
+    # strict chronological split
     train_frac: float = 0.70
     val_frac: float = 0.15
 
-    # IMPORTANT: embargo should be ~= horizon seconds to prevent overlap leakage
+    # embargo ~= horizon to avoid forward-label overlap across split boundaries
     embargo_seconds: int = 600
 
     # threshold search
@@ -73,7 +71,7 @@ class Config:
     # model
     ridge_alpha: float = 1.0
 
-    # scenarios
+    # execution assumptions
     scenarios: Tuple[Scenario, ...] = (
         Scenario("taker_realistic", fee_bps_per_side=5.0, use_spread_cost=True),
         Scenario("maker_optimistic", fee_bps_per_side=1.0, use_spread_cost=False),
@@ -98,6 +96,7 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 # Helpers
 # -----------------------------------------------------------------------------
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize time index to a sorted DatetimeIndex (UTC)."""
     if isinstance(df.index, pd.DatetimeIndex):
         return df.sort_index()
     if "ts" in df.columns:
@@ -114,9 +113,9 @@ def _bps_to_decimal(bps: float) -> float:
 
 def _pick_features(df: pd.DataFrame) -> List[str]:
     """
-    Minimal, explicit leak guard:
-      - drop any y_* columns
-      - drop segment_id (it can leak segmentation/gaps/time)
+    Minimal leak guard:
+      - drop y_* (targets / labels)
+      - drop segment_id (often encodes segmentation/gaps/time)
       - keep numeric only
     """
     feats: List[str] = []
@@ -139,10 +138,11 @@ def _purged_time_split(
     embargo_seconds: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Chronological split by row count, then PURGE by time:
-      - drop last embargo_seconds of TRAIN
-      - drop last embargo_seconds of VAL
-    This prevents forward-label overlap across boundaries (t+horizon crossing).
+    Split by row count (chronological), then purge tails:
+      - drop last `embargo_seconds` from TRAIN
+      - drop last `embargo_seconds` from VAL
+
+    Goal: avoid t+horizon label overlap bleeding across split boundaries.
     """
     if train_frac + val_frac >= 1.0:
         raise ValueError("train_frac + val_frac must be < 1.0")
@@ -172,6 +172,7 @@ def _purged_time_split(
 
 
 def _ic_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Pearson IC with a couple guardrails to avoid junk stats."""
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     if len(y_true) < 5 or np.std(y_true) == 0 or np.std(y_pred) == 0:
@@ -180,6 +181,7 @@ def _ic_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def _sharpe(x: np.ndarray) -> float:
+    """Mean/std Sharpe proxy (no annualization)."""
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if len(x) < 10:
@@ -192,23 +194,25 @@ def _sharpe(x: np.ndarray) -> float:
 
 def _breakeven_rel(df: pd.DataFrame, fee_bps_per_side: float, use_spread_cost: bool) -> pd.Series:
     """
-    Very simple breakeven (relative):
-      breakeven ≈ 2*fee + spread_rel (if spread cost enabled)
-    This matches what you've already been observing (~0.001... for taker 5bps/side).
+    Per-row breakeven threshold in relative-return space.
+
+    breakeven ≈ 2*fee + (spread/mid) when spread cost is enabled.
     """
     fee = _bps_to_decimal(fee_bps_per_side)
     be = pd.Series(2.0 * fee, index=df.index, dtype=float)
+
     if use_spread_cost:
         if "spread_rel" in df.columns:
             be = be + df["spread_rel"].astype(float).fillna(0.0)
         else:
             # fallback: spread / mid
             be = be + (df["spread"].astype(float) / df["mid"].astype(float)).fillna(0.0)
+
     return be
 
 
 def _mid_fwd_from_yret(df: pd.DataFrame, yret_col: str) -> pd.Series:
-    # mid_fwd = mid * (1 + yret)
+    """Reconstruct mid_fwd from forward return label."""
     return df["mid"].astype(float) * (1.0 + df[yret_col].astype(float))
 
 
@@ -221,10 +225,9 @@ def _pnl_proxy(
 ) -> np.ndarray:
     """
     One-shot PnL proxy:
-      - long enters at ask (if spread cost) else mid
-      - short enters at bid (if spread cost) else mid
-      - exits at mid_fwd derived from y_ret_fwd_H
-      - fees charged twice (enter+exit)
+      - entry at ask/bid when spread cost is enabled, otherwise mid
+      - exit at mid_fwd reconstructed from y_ret_fwd_*
+      - fees charged on entry + exit
     """
     sig = np.asarray(signal, dtype=int)
 
@@ -238,13 +241,13 @@ def _pnl_proxy(
     entry_long = ask if use_spread_cost else mid
     entry_short = bid if use_spread_cost else mid
 
-    # gross returns
     r_long = (mid_fwd - entry_long) / entry_long
     r_short = (entry_short - mid_fwd) / entry_short
 
-    # net (two-sided fees)
-    r_long_net = (1.0 + r_long) * (1.0 - fee) * (1.0 - fee) - 1.0
-    r_short_net = (1.0 + r_short) * (1.0 - fee) * (1.0 - fee) - 1.0
+    # two-sided fee drag
+    fee_mult = (1.0 - fee) * (1.0 - fee)
+    r_long_net = (1.0 + r_long) * fee_mult - 1.0
+    r_short_net = (1.0 + r_short) * fee_mult - 1.0
 
     out = np.zeros_like(mid, dtype=float)
     out[sig == 1] = r_long_net[sig == 1]
@@ -254,6 +257,7 @@ def _pnl_proxy(
 
 
 def _signals_from_pred(pred: np.ndarray, breakeven: np.ndarray, k: float) -> np.ndarray:
+    """Thresholded sign strategy: +/-1 when pred clears k*breakeven, else 0."""
     pred = np.asarray(pred, dtype=float)
     be = np.asarray(breakeven, dtype=float)
     thr = float(k) * be
@@ -265,6 +269,7 @@ def _signals_from_pred(pred: np.ndarray, breakeven: np.ndarray, k: float) -> np.
 
 
 def _stats_from_pnl(pnl: np.ndarray, signal: np.ndarray) -> Dict[str, float]:
+    """Basic trade-only stats."""
     sig = np.asarray(signal, dtype=int)
     pnl = np.asarray(pnl, dtype=float)
 
@@ -290,6 +295,7 @@ def _choose_k_on_val(
     k_grid: Tuple[float, ...],
     min_trades_val: int,
 ) -> Tuple[float, Dict[str, float]]:
+    """Grid-search k on VAL, using Sharpe as the tie-breaker (min trade count enforced)."""
     be = _breakeven_rel(val_df, scenario.fee_bps_per_side, scenario.use_spread_cost).values
     best_k = float(k_grid[0])
     best_stats = {"trades": 0.0, "mean_ret": 0.0, "sharpe": 0.0, "hit_rate": 0.0}
@@ -309,7 +315,7 @@ def _choose_k_on_val(
             best_k = float(k)
             best_stats = stats
 
-    # If nothing meets min trades, fall back to k=first with whatever stats
+    # nothing cleared min_trades_val -> default to first k and report whatever it does
     if best_score == -np.inf:
         k0 = float(k_grid[0])
         sig0 = _signals_from_pred(pred_val, be, k0)
@@ -343,22 +349,16 @@ def main() -> None:
     if yret_col not in df.columns:
         raise ValueError(f"Expected forward return column '{yret_col}' not found in dataset.")
 
-    # Drop NaNs needed for model + pnl
+    # Keep only rows usable for both model + PnL proxy
     required = [yret_col, "mid", "best_bid", "best_ask"]
     df = df.dropna(subset=required).copy()
 
     feat_cols = _pick_features(df)
 
-    # 1) never allow target columns
-    feat_cols = [c for c in feat_cols if not c.startswith("y_")]
-
-    # 2) HARD BLOCK: forward-looking columns must not be features
-    LEAK_BLOCKLIST = {"mid_fwd"}  # extend if you add others later
+    # Extra leak fence (cheap + loud if something sneaks in later)
+    LEAK_BLOCKLIST = {"mid_fwd"}  # extend as needed
     feat_cols = [c for c in feat_cols if c not in LEAK_BLOCKLIST]
-
-    # 3) sanity asserts (fail fast if leakage sneaks back in)
     assert "mid_fwd" not in feat_cols, "Leak: mid_fwd must not be a feature."
-
 
     train_df, val_df, test_df = _purged_time_split(
         df,
@@ -373,9 +373,9 @@ def main() -> None:
         print(f"[rows] total={len(df):,} | train={len(train_df):,} val={len(val_df):,} test={len(test_df):,}")
         print(f"[time] {df.index.min()} -> {df.index.max()}")
         print(f"[purge] embargo_seconds={CFG.embargo_seconds} (train&val tails removed)")
-        print(f"[features] n={len(feat_cols)} (segment_id removed, y_* removed)")
+        print(f"[features] n={len(feat_cols)} (y_* + segment_id removed)")
 
-    # Train ridge on y_ret
+    # Train ridge on forward returns
     X_train = train_df[feat_cols].values
     y_train = train_df[yret_col].astype(float).values
 
@@ -422,7 +422,7 @@ def main() -> None:
     }
 
     for sc in CFG.scenarios:
-        # choose k on VAL
+        # pick threshold multiplier on VAL
         k_star, val_stats = _choose_k_on_val(
             val_df=val_df,
             pred_val=pred_val,
@@ -432,13 +432,13 @@ def main() -> None:
             min_trades_val=CFG.min_trades_val,
         )
 
-        # evaluate TEST model
+        # TEST: model-driven signals
         be_test = _breakeven_rel(test_df, sc.fee_bps_per_side, sc.use_spread_cost).values
         sig_test = _signals_from_pred(pred_test, be_test, k_star)
         pnl_test = _pnl_proxy(test_df, sig_test, yret_col, sc.fee_bps_per_side, sc.use_spread_cost)
         test_stats = _stats_from_pnl(pnl_test, sig_test)
 
-        # oracle TEST
+        # TEST: oracle signals (upper bound with same thresholding rule)
         sig_oracle = _signals_from_pred(y_test, be_test, k_star)
         pnl_oracle = _pnl_proxy(test_df, sig_oracle, yret_col, sc.fee_bps_per_side, sc.use_spread_cost)
         oracle_stats = _stats_from_pnl(pnl_oracle, sig_oracle)
