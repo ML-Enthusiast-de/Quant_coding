@@ -9,3 +9,4 @@ venv/
 data/portfolio/current_portfolio.csv
 data/*
 !data/sp500_symbols.csv
+Options/data/*

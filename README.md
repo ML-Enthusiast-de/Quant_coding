@@ -7,6 +7,20 @@
 
 This repo is my personal sandbox for **quantitative trading research** in Python.
 
+---
+
+## 📌 New: Options Surface Research (SPY IV Surface Lab)
+
+A separate, dedicated options research track lives here:
+
+➡️ **`Options/README.md`**
+
+It focuses on building **daily SPY implied volatility surfaces (EOD)** from option chains, applying data hygiene + no-arbitrage diagnostics, fitting a smooth surface, and researching **surface dynamics** (ATM level, skew, term structure) with hedged PnL proxies.
+
+> Go to: **Options/README.md** for setup, data expectations, and pipeline details.
+
+---
+
 There are currently three main “tracks”:
 
 1. **Single-asset time-series** on SPY (daily data, sequence models)  
@@ -173,60 +187,6 @@ The **live inference** entry point for the cross-sectional model is:
 
 - `scripts/sp500_cs_inference_live.py`
 
-What it does:
-
-1. **Load model bundle**
-
-   - Loads `models/sp500_tree_cs_21d_live.pkl`.
-   - Extracts model, `q_live`, `lookahead`, `cost_bps`, and expected feature names.
-
-2. **Fetch recent prices & build features for “today”**
-
-   - Uses `load_sp500_adj_close` from `src/data_loading_cross.py`.
-   - Computes the required feature columns **only for the last date**.
-   - Drops tickers with insufficient history / NaNs.
-
-3. **Predict cross-sectional forward returns**
-
-   - Predicts **21-day forward returns** for each ticker (`pred_fwd_21`).
-   - Applies the configured **round-trip transaction cost** to get `pred_fwd_21_net`.
-   - Converts this to **daily net returns** (`pred_daily_net`).
-
-4. **Equal-weight benchmark & edges**
-
-   - Computes an **equal-weight benchmark** over the universe:
-
-     ```text
-     eqw_daily_net = model-implied average daily net return
-                     if you held all available stocks equally weighted
-                     over the horizon (after costs)
-     ```
-
-   - For each ticker, computes `edge_vs_eqw_daily = pred_daily_net - eqw_daily_net`.
-
-5. **Rank and output paper-trade signals**
-
-   - Sorts by `pred_daily_net` (descending).
-   - Outputs:
-     - top *N* tickers to **long**,
-     - bottom *N* tickers to **short**,
-     - plus predicted forward return, daily net return, and edge vs equal-weight.
-
-6. **Logging**
-
-   - Logs full-universe predictions to:
-
-     ```text
-     data/paper_trade/sp500_cs_predictions.parquet
-     ```
-
-   - Each row includes:
-     - `as_of_date`, `ticker`
-     - `side` (long / short / flat)
-     - `rank` (1 = best)
-     - `pred_fwd_21`, `pred_fwd_21_net`, `pred_daily_net`, `edge_vs_eqw_daily`
-     - model metadata (`model_name`, `model_version`, `q_live`, `cost_bps`, train period)
-
 Again: this is **paper trading only**, not a live execution system.
 
 ---
@@ -238,13 +198,3 @@ There is an experimental **portfolio manager** that sits on top of the live cros
 - Script: `scripts/portfolio_manager.py` (imports `run_inference` from `sp500_cs_inference_live.py`)
 - Portfolio file (user-owned, gitignored):  
   `data/portfolio/current_portfolio.csv`
-
-### Portfolio CSV schema
-
-The portfolio manager expects a CSV like:
-
-```csv
-ticker,shares,cost_basis,current_price
-AAPL,15,190.50,228.30
-MSFT,10,310.00,476.12
-SPY,5,420.00,543.10
