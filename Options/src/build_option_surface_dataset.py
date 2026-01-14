@@ -18,8 +18,9 @@ ROOT_DIR = OPTIONS_DIR.parents[0]      # .../Quant_coding
 CSV_PATH = ROOT_DIR / "data" / "archive" / "spy_2020_2022.csv"
 OUT_DIR = OPTIONS_DIR / "data" / "processed"
 
-CHAIN_CHUNKS_DIR = OUT_DIR / "chain_chunks"
-IV_CHUNKS_DIR = OUT_DIR / "iv_chunks"
+RAW_MONTH_DIR = OUT_DIR / "raw_month"          # stage 1 output
+CHAIN_CHUNKS_DIR = OUT_DIR / "chain_chunks"    # stage 2 output
+IV_CHUNKS_DIR = OUT_DIR / "iv_chunks"          # stage 2 output
 CHECKPOINT_PATH = OUT_DIR / "checkpoint.json"
 
 # Cleaning knobs
@@ -28,8 +29,9 @@ MIN_MID = 0.01
 LOG_MONEYNESS_CLIP = 0.8
 
 # Streaming knobs
-CHUNKSIZE = 250_000  # raw CSV rows per pandas chunk
-# Flush buffers when they reach these sizes (rows in long-form)
+CSV_CHUNKSIZE = 250_000
+
+# Output flush knobs (processed)
 FLUSH_CHAIN_ROWS = 30_000
 FLUSH_IV_ROWS = 20_000
 
@@ -125,7 +127,7 @@ def estimate_forward_df(strikes, call_mids, put_mids):
 
 
 # -----------------------------
-# Helpers: columns / checkpoint / IO
+# Helpers
 # -----------------------------
 def normalize_columns_index(cols: pd.Index) -> pd.Index:
     return (
@@ -148,8 +150,10 @@ def get_raw_usecols_for_normalized(csv_path: Path, want_norm: list[str]) -> list
 
     missing = [c for c in want_norm if c not in norm_to_raw]
     if missing:
-        raise ValueError(f"Missing required columns after normalization: {missing}\n"
-                         f"Available normalized columns: {sorted(norm_to_raw.keys())}")
+        raise ValueError(
+            f"Missing required columns after normalization: {missing}\n"
+            f"Available normalized columns: {sorted(norm_to_raw.keys())}"
+        )
 
     return [norm_to_raw[c] for c in want_norm]
 
@@ -166,8 +170,10 @@ def load_checkpoint() -> dict:
         with open(CHECKPOINT_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     return {
-        "last_saved_date": None,   # ISO date string
-        "month_next_part": {},     # e.g., {"2020-01": 3}
+        "raw_shard_done": False,
+        "raw_parts_next": {},           # month -> next raw part index
+        "processed_months_done": [],    # months fully processed
+        "month_next_part": {},          # month -> next processed output part index
     }
 
 
@@ -179,32 +185,62 @@ def save_checkpoint(state: dict) -> None:
     tmp.replace(CHECKPOINT_PATH)
 
 
-def month_key_from_date(d: pd.Timestamp | str) -> str:
-    # expects date-like; output "YYYY-MM"
-    s = str(d)
-    return s[:7]
+def next_index_for(state: dict, key_dict: str, month: str, fallback_dir: Path, glob_pat: str) -> int:
+    if month in state[key_dict]:
+        return int(state[key_dict][month])
 
-
-def next_part_index(month_key: str, state: dict) -> int:
-    # Prefer checkpoint; otherwise infer from existing files
-    if month_key in state["month_next_part"]:
-        return int(state["month_next_part"][month_key])
-
-    existing = sorted(IV_CHUNKS_DIR.glob(f"iv_{month_key}_part*.parquet"))
+    existing = sorted(fallback_dir.glob(glob_pat.format(month=month)))
     if not existing:
         idx = 1
     else:
-        # iv_YYYY-MM_part0007.parquet
         last = existing[-1].stem
         part_str = last.split("_part")[-1]
         idx = int(part_str) + 1
 
-    state["month_next_part"][month_key] = idx
+    state[key_dict][month] = idx
     return idx
 
 
+def _to_float_series(s: pd.Series) -> pd.Series:
+    """
+    Robust numeric parse for messy columns:
+    - handles commas "1,234"
+    - handles blanks / NA
+    - returns float64
+    """
+    # ensure string for replace, but keep NaN
+    s2 = s.astype(str)
+    s2 = s2.str.replace(",", "", regex=False)
+    s2 = s2.replace({"nan": np.nan, "None": np.nan, "": np.nan, "NA": np.nan, "N/A": np.nan, "null": np.nan})
+    return pd.to_numeric(s2, errors="coerce").astype("float64")
+
+
+def coerce_raw_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stage 1 raw shards:
+    - store date columns as string
+    - store ALL numeric columns as float64 (even volume/DTE) to avoid Int casting issues
+    """
+    df = df.copy()
+
+    for c in ["QUOTE_DATE", "EXPIRE_DATE"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+
+    num_cols = [
+        "DTE", "UNDERLYING_LAST", "STRIKE",
+        "C_BID", "C_ASK", "P_BID", "P_ASK",
+        "C_VOLUME", "P_VOLUME",
+    ]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = _to_float_series(df[c])
+
+    return df
+
+
 # -----------------------------
-# Core pipeline per day (keeps parity groups intact)
+# Stage 2: per-day pipeline (within a month)
 # -----------------------------
 def build_long_chain_for_day(df_day: pd.DataFrame) -> pd.DataFrame:
     df = df_day.copy()
@@ -327,17 +363,21 @@ def compute_iv_points(chain: pd.DataFrame, date_str: str) -> pd.DataFrame:
     return iv_df[keep].copy()
 
 
-# -----------------------------
-# Chunked buffering + flushing (MONTH parts)
-# -----------------------------
-def flush_month_buffers(month_key: str, buf_chain: pd.DataFrame, buf_iv: pd.DataFrame, state: dict) -> None:
-    """
-    Writes one chain chunk + one iv chunk for a given month, increments part index.
-    """
-    if len(buf_chain) == 0 and len(buf_iv) == 0:
+def flush_processed_month(month_key: str, chain_buf_list: list[pd.DataFrame], iv_buf_list: list[pd.DataFrame], state: dict) -> None:
+    if not chain_buf_list and not iv_buf_list:
         return
 
-    part = next_part_index(month_key, state)
+    buf_chain = pd.concat(chain_buf_list, ignore_index=True) if chain_buf_list else pd.DataFrame()
+    buf_iv = pd.concat(iv_buf_list, ignore_index=True) if iv_buf_list else pd.DataFrame()
+
+    part = next_index_for(
+        state=state,
+        key_dict="month_next_part",
+        month=month_key,
+        fallback_dir=IV_CHUNKS_DIR,
+        glob_pat="iv_{month}_part*.parquet",
+    )
+
     chain_path = CHAIN_CHUNKS_DIR / f"chain_{month_key}_part{part:04d}.parquet"
     iv_path = IV_CHUNKS_DIR / f"iv_{month_key}_part{part:04d}.parquet"
 
@@ -347,22 +387,20 @@ def flush_month_buffers(month_key: str, buf_chain: pd.DataFrame, buf_iv: pd.Data
         atomic_to_parquet(buf_iv, iv_path)
 
     state["month_next_part"][month_key] = part + 1
-    print(f"  Flushed month={month_key} part={part:04d}: chain_rows={len(buf_chain):,}, iv_rows={len(buf_iv):,}")
+    save_checkpoint(state)
+    print(f"  Flushed processed month={month_key} part={part:04d}: chain_rows={len(buf_chain):,}, iv_rows={len(buf_iv):,}")
 
 
-def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    CHAIN_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
-    IV_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+# =========================================================
+# Stage 1: shard raw CSV -> monthly raw parquet parts (order independent, safe dtypes)
+# =========================================================
+def stage1_shard_raw_csv(state: dict) -> None:
+    if state.get("raw_shard_done", False):
+        print("Stage 1: raw sharding already done. Skipping.")
+        return
 
-    if not CSV_PATH.exists():
-        raise FileNotFoundError(f"CSV not found at:\n{CSV_PATH}")
+    RAW_MONTH_DIR.mkdir(parents=True, exist_ok=True)
 
-    state = load_checkpoint()
-    last_saved_date = state.get("last_saved_date", None)
-    print("Checkpoint last_saved_date:", last_saved_date)
-
-    # We read only needed columns; header normalization is handled
     want_norm = [
         "QUOTE_DATE", "EXPIRE_DATE", "DTE", "UNDERLYING_LAST", "STRIKE",
         "C_BID", "C_ASK", "P_BID", "P_ASK",
@@ -370,151 +408,135 @@ def main():
     ]
     raw_usecols = get_raw_usecols_for_normalized(CSV_PATH, want_norm)
 
-    carry = None  # carry last incomplete day between CSV chunks
-
-    # Buffers keyed by month (we keep only a few months at a time because CSV is usually sorted by date)
-    month_chain_buf = {}
-    month_iv_buf = {}
-    month_chain_rows = {}
-    month_iv_rows = {}
-
-    processed_days = 0
-    skipped_days = 0
-
     reader = pd.read_csv(
         CSV_PATH,
         usecols=raw_usecols,
-        chunksize=CHUNKSIZE,
+        chunksize=CSV_CHUNKSIZE,
         low_memory=False,
     )
 
     for chunk_idx, chunk in enumerate(reader, start=1):
-        # normalize headers
         chunk.columns = normalize_columns_index(chunk.columns)
 
-        # optional fast skip: if we already saved up to a date, skip those rows early
-        qd = pd.to_datetime(chunk["QUOTE_DATE"], errors="coerce").dt.date
-        chunk = chunk.assign(_quote_date=qd).dropna(subset=["_quote_date"])
+        qd = pd.to_datetime(chunk["QUOTE_DATE"], errors="coerce")
+        chunk = chunk.assign(_qd=qd).dropna(subset=["_qd"])
+        chunk = chunk.assign(_month=chunk["_qd"].astype(str).str.slice(0, 7))
 
-        if last_saved_date is not None:
-            # skip anything <= last_saved_date
-            chunk = chunk[chunk["_quote_date"] > pd.to_datetime(last_saved_date).date()]
+        for month, g in chunk.groupby("_month", sort=False):
+            g2 = g.drop(columns=["_qd", "_month"])
+            g2 = coerce_raw_dtypes(g2)
 
-        if len(chunk) == 0:
-            print(f"Chunk {chunk_idx}: all rows skipped by checkpoint/date filter.")
+            part = next_index_for(
+                state=state,
+                key_dict="raw_parts_next",
+                month=month,
+                fallback_dir=RAW_MONTH_DIR,
+                glob_pat="spy_raw_{month}_part*.parquet",
+            )
+            out_path = RAW_MONTH_DIR / f"spy_raw_{month}_part{part:04d}.parquet"
+            atomic_to_parquet(g2, out_path)
+
+            state["raw_parts_next"][month] = part + 1
+
+        if chunk_idx % 5 == 0:
+            save_checkpoint(state)
+            print(f"Stage1: wrote raw parts through CSV chunk {chunk_idx}")
+
+    state["raw_shard_done"] = True
+    save_checkpoint(state)
+    print("Stage 1 done: raw sharding complete.")
+
+
+# =========================================================
+# Stage 2: process monthly raw shards -> chain/iv chunks
+# =========================================================
+def stage2_process_months(state: dict) -> None:
+    CHAIN_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+    IV_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not RAW_MONTH_DIR.exists():
+        raise FileNotFoundError(f"Raw month directory not found: {RAW_MONTH_DIR}")
+
+    done = set(state.get("processed_months_done", []))
+
+    raw_parts = sorted(RAW_MONTH_DIR.glob("spy_raw_????-??_part*.parquet"))
+    months = sorted({p.name.split("_")[2] for p in raw_parts})
+
+    if not months:
+        raise FileNotFoundError(f"No raw shard parts found in {RAW_MONTH_DIR}")
+
+    print(f"Stage2: found {len(months)} months to process.")
+
+    for month in months:
+        if month in done:
+            print(f"Stage2: month {month} already done. Skipping.")
             continue
 
-        # attach carry
-        if carry is not None and len(carry) > 0:
-            carry.columns = normalize_columns_index(carry.columns)
-            chunk = pd.concat([carry, chunk.drop(columns=["_quote_date"])], ignore_index=True)
-        else:
-            chunk = chunk.drop(columns=["_quote_date"])
+        print(f"\nStage2: processing month {month} ...")
+        parts = sorted(RAW_MONTH_DIR.glob(f"spy_raw_{month}_part*.parquet"))
+        df_month = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
+        df_month.columns = normalize_columns_index(df_month.columns)
 
-        # determine day boundaries (assumes CSV is ordered by QUOTE_DATE)
-        qd2 = pd.to_datetime(chunk["QUOTE_DATE"], errors="coerce").dt.date
-        chunk = chunk.assign(_quote_date=qd2).dropna(subset=["_quote_date"])
+        qd = pd.to_datetime(df_month["QUOTE_DATE"], errors="coerce").dt.date
+        df_month = df_month.assign(_quote_date=qd).dropna(subset=["_quote_date"])
 
-        last_day = chunk["_quote_date"].iloc[-1]
-        carry = chunk[chunk["_quote_date"] == last_day].drop(columns=["_quote_date"])
-        complete = chunk[chunk["_quote_date"] != last_day].drop(columns=["_quote_date"])
+        chain_buf_list: list[pd.DataFrame] = []
+        iv_buf_list: list[pd.DataFrame] = []
+        chain_rows = 0
+        iv_rows = 0
 
-        # process complete days in this chunk
-        if len(complete) > 0:
-            for day, df_day in complete.groupby(pd.to_datetime(complete["QUOTE_DATE"], errors="coerce").dt.date, sort=False):
-                date_str = day.isoformat()
-                print(f"Processing day {date_str} ...")
+        for day, df_day in df_month.groupby("_quote_date", sort=True):
+            date_str = day.isoformat()
 
-                # day pipeline
-                chain = build_long_chain_for_day(df_day)
-                chain = clean_chain(chain)
-                chain = add_forward_df(chain)
-                iv_out = compute_iv_points(chain, date_str)
-
-                mkey = month_key_from_date(date_str)
-
-                # init month buffers
-                if mkey not in month_chain_buf:
-                    month_chain_buf[mkey] = []
-                    month_iv_buf[mkey] = []
-                    month_chain_rows[mkey] = 0
-                    month_iv_rows[mkey] = 0
-
-                month_chain_buf[mkey].append(chain)
-                month_iv_buf[mkey].append(iv_out)
-                month_chain_rows[mkey] += len(chain)
-                month_iv_rows[mkey] += len(iv_out)
-
-                processed_days += 1
-
-                # flush if large enough
-                if month_chain_rows[mkey] >= FLUSH_CHAIN_ROWS or month_iv_rows[mkey] >= FLUSH_IV_ROWS:
-                    buf_chain = pd.concat(month_chain_buf[mkey], ignore_index=True) if month_chain_rows[mkey] > 0 else pd.DataFrame()
-                    buf_iv = pd.concat(month_iv_buf[mkey], ignore_index=True) if month_iv_rows[mkey] > 0 else pd.DataFrame()
-
-                    flush_month_buffers(mkey, buf_chain, buf_iv, state)
-
-                    # reset buffers for that month
-                    month_chain_buf[mkey] = []
-                    month_iv_buf[mkey] = []
-                    month_chain_rows[mkey] = 0
-                    month_iv_rows[mkey] = 0
-
-                    # only update checkpoint once we actually wrote something
-                    state["last_saved_date"] = date_str
-                    last_saved_date = date_str
-                    save_checkpoint(state)
-
-            print(f"After chunk {chunk_idx}: processed_days={processed_days}, skipped_days={skipped_days}")
-
-        else:
-            print(f"Chunk {chunk_idx}: no complete day yet (carry={last_day.isoformat()}).")
-
-    # process final carry
-    if carry is not None and len(carry) > 0:
-        day = pd.to_datetime(carry["QUOTE_DATE"], errors="coerce").dt.date.iloc[0]
-        date_str = day.isoformat()
-        if last_saved_date is None or day > pd.to_datetime(last_saved_date).date():
-            print(f"Processing final carry day {date_str} ...")
-
-            chain = build_long_chain_for_day(carry)
+            chain = build_long_chain_for_day(df_day.drop(columns=["_quote_date"]))
             chain = clean_chain(chain)
             chain = add_forward_df(chain)
             iv_out = compute_iv_points(chain, date_str)
 
-            mkey = month_key_from_date(date_str)
-            if mkey not in month_chain_buf:
-                month_chain_buf[mkey] = []
-                month_iv_buf[mkey] = []
-                month_chain_rows[mkey] = 0
-                month_iv_rows[mkey] = 0
+            chain_buf_list.append(chain)
+            iv_buf_list.append(iv_out)
+            chain_rows += len(chain)
+            iv_rows += len(iv_out)
 
-            month_chain_buf[mkey].append(chain)
-            month_iv_buf[mkey].append(iv_out)
-            month_chain_rows[mkey] += len(chain)
-            month_iv_rows[mkey] += len(iv_out)
+            if chain_rows >= FLUSH_CHAIN_ROWS or iv_rows >= FLUSH_IV_ROWS:
+                flush_processed_month(month, chain_buf_list, iv_buf_list, state)
+                chain_buf_list = []
+                iv_buf_list = []
+                chain_rows = 0
+                iv_rows = 0
 
-            processed_days += 1
+        flush_processed_month(month, chain_buf_list, iv_buf_list, state)
 
-    # flush all remaining month buffers at end
-    for mkey in sorted(month_chain_buf.keys()):
-        buf_chain = pd.concat(month_chain_buf[mkey], ignore_index=True) if month_chain_rows[mkey] > 0 else pd.DataFrame()
-        buf_iv = pd.concat(month_iv_buf[mkey], ignore_index=True) if month_iv_rows[mkey] > 0 else pd.DataFrame()
+        state.setdefault("processed_months_done", [])
+        state["processed_months_done"].append(month)
+        save_checkpoint(state)
+        done.add(month)
 
-        if len(buf_chain) == 0 and len(buf_iv) == 0:
-            continue
+        print(f"Stage2: month {month} done.")
 
-        flush_month_buffers(mkey, buf_chain, buf_iv, state)
+    print("\nStage 2 done: all months processed.")
 
-    # update checkpoint with the latest date we processed (best-effort)
-    # (we only know reliably dates that got flushed; that’s okay)
-    save_checkpoint(state)
+
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not CSV_PATH.exists():
+        raise FileNotFoundError(f"CSV not found at:\n{CSV_PATH}")
+
+    state = load_checkpoint()
+    print("Checkpoint loaded from:", CHECKPOINT_PATH)
+
+    print("\n=== Stage 1: Shard raw CSV by month (order independent) ===")
+    stage1_shard_raw_csv(state)
+
+    print("\n=== Stage 2: Build clean chain + IV points from monthly shards ===")
+    stage2_process_months(state)
 
     print("\nDone.")
-    print("Chunk outputs:")
-    print(f"- {CHAIN_CHUNKS_DIR}")
-    print(f"- {IV_CHUNKS_DIR}")
-    print(f"Checkpoint: {CHECKPOINT_PATH}")
+    print("Outputs:")
+    print(f"- Raw shards: {RAW_MONTH_DIR}")
+    print(f"- Chain chunks: {CHAIN_CHUNKS_DIR}")
+    print(f"- IV chunks: {IV_CHUNKS_DIR}")
+    print(f"- Checkpoint: {CHECKPOINT_PATH}")
 
 
 if __name__ == "__main__":
