@@ -30,8 +30,8 @@ LOG_MONEYNESS_CLIP = 0.8
 # Streaming knobs
 CHUNKSIZE = 250_000  # raw CSV rows per pandas chunk
 # Flush buffers when they reach these sizes (rows in long-form)
-FLUSH_CHAIN_ROWS = 300_000
-FLUSH_IV_ROWS = 200_000
+FLUSH_CHAIN_ROWS = 30_000
+FLUSH_IV_ROWS = 20_000
 
 # progress inside IV loop
 PROGRESS_EVERY = 50_000
