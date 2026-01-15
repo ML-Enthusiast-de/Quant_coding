@@ -45,6 +45,7 @@ This repo starts with **EOD (end-of-day)** SPY option chains to build a robust p
 ## Current status
 
 ✅ **Phase 1 implemented:** build dataset + implied vol extraction (EOD)  
+   Currently building option_surface_dataset -> next step: stitching chuncks to a single dataset
 ⬜ Phase 2–5 planned (no-arb checks, surface fitting, forecasting, hedged PnL proxy)
 
 ---
