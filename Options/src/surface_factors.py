@@ -31,6 +31,15 @@ K_SEARCH_MIN = -0.9
 K_SEARCH_MAX = 0.9
 EPS = 1e-8
 
+# Hard sanity bounds (research hygiene)
+IV_FIT_MAX = 3.0   # drop smile grid rows with iv_fit > this
+IV_FIT_MIN = 0.001
+
+ATM_MIN, ATM_MAX = 0.01, 3.0
+RR_MIN, RR_MAX = -2.0, 2.0
+BF_MIN, BF_MAX = -2.0, 2.0
+SLOPE_MIN, SLOPE_MAX = -2.0, 2.0
+
 
 # -----------------------------
 # Black–Scholes forward-delta mapping
@@ -129,6 +138,23 @@ def closest_in_T(Ts: np.ndarray, ys: np.ndarray, T0: float) -> tuple[float, floa
     return float(ys2[idx]), T_used, gap_days
 
 
+# -----------------------------
+# Clamp helper
+# -----------------------------
+def clamp_df(df: pd.DataFrame, col: str, lo: float, hi: float) -> int:
+    """
+    Clamp by setting out-of-range values to NaN.
+    Returns how many values were set to NaN.
+    """
+    if col not in df.columns:
+        return 0
+    s = pd.to_numeric(df[col], errors="coerce")
+    bad = (~np.isfinite(s)) | (s < lo) | (s > hi)
+    n_bad = int(bad.sum())
+    df.loc[bad, col] = np.nan
+    return n_bad
+
+
 # =========================================================
 # Main
 # =========================================================
@@ -148,10 +174,12 @@ def main():
     df["k"] = pd.to_numeric(df["k"], errors="coerce")
     df["iv_fit"] = pd.to_numeric(df["iv_fit"], errors="coerce")
     df = df.dropna(subset=["quote_date", "expiry", "T", "k", "iv_fit"])
-    df = df[(df["T"] > 0) & (df["iv_fit"] > 0)]
 
-    print(f"Loaded fitted smile grid: {len(df):,} rows")
-    print("Computing factors (exact interpolation + closest maturity with gap tracking)...")
+    # Source-level sanity: drop insane fitted vols
+    df = df[(df["T"] > 0) & (df["iv_fit"] > IV_FIT_MIN) & (df["iv_fit"] <= IV_FIT_MAX)].copy()
+
+    print(f"Loaded fitted smile grid (after iv_fit filter <= {IV_FIT_MAX}): {len(df):,} rows")
+    print("Computing factors (exact interpolation + closest maturity + gap tracking)...")
 
     out_rows = []
 
@@ -184,29 +212,28 @@ def main():
 
         day_out = {"quote_date": qd}
 
-        # Exact tenors (interpolation)
+        # Exact tenors (interpolation in T)
         for d, T0 in zip(TENORS_DAYS, TENORS):
             day_out[f"atm_{d}d_exact"] = interp_in_T(Ts, exp_df["atm_iv"].to_numpy(dtype=float), T0)
             day_out[f"rr25_{d}d_exact"] = interp_in_T(Ts, exp_df["rr_25"].to_numpy(dtype=float), T0)
             day_out[f"bf25_{d}d_exact"] = interp_in_T(Ts, exp_df["bf_25"].to_numpy(dtype=float), T0)
 
-        # Closest maturity factors + tracking
+        # Closest maturity + tracking
         for d, T0 in zip(TENORS_DAYS, TENORS):
             v, T_used, gap = closest_in_T(Ts, exp_df["atm_iv"].to_numpy(dtype=float), T0)
             day_out[f"atm_{d}d_closest"] = v
             day_out[f"T_used_{d}d"] = T_used
             day_out[f"gap_days_{d}d"] = gap
 
-            v, T_used, gap = closest_in_T(Ts, exp_df["rr_25"].to_numpy(dtype=float), T0)
+            v, _, _ = closest_in_T(Ts, exp_df["rr_25"].to_numpy(dtype=float), T0)
             day_out[f"rr25_{d}d_closest"] = v
 
-            v, T_used, gap = closest_in_T(Ts, exp_df["bf_25"].to_numpy(dtype=float), T0)
+            v, _, _ = closest_in_T(Ts, exp_df["bf_25"].to_numpy(dtype=float), T0)
             day_out[f"bf25_{d}d_closest"] = v
 
         # Term slopes short-long
         d_short, d_long = TENORS_DAYS[0], TENORS_DAYS[-1]
 
-        # exact slopes
         a_s = day_out.get(f"atm_{d_short}d_exact", np.nan)
         a_l = day_out.get(f"atm_{d_long}d_exact", np.nan)
         day_out["term_slope_atm_exact"] = (a_s - a_l) if np.isfinite(a_s) and np.isfinite(a_l) else np.nan
@@ -215,7 +242,6 @@ def main():
         r_l = day_out.get(f"rr25_{d_long}d_exact", np.nan)
         day_out["term_slope_rr25_exact"] = (r_s - r_l) if np.isfinite(r_s) and np.isfinite(r_l) else np.nan
 
-        # closest slopes
         a_s = day_out.get(f"atm_{d_short}d_closest", np.nan)
         a_l = day_out.get(f"atm_{d_long}d_closest", np.nan)
         day_out["term_slope_atm_closest"] = (a_s - a_l) if np.isfinite(a_s) and np.isfinite(a_l) else np.nan
@@ -227,12 +253,40 @@ def main():
         out_rows.append(day_out)
 
     out = pd.DataFrame(out_rows).sort_values("quote_date").reset_index(drop=True)
+
+    # -------------------------------------------------
+    # Sanity clamps on factors (post aggregation)
+    # -------------------------------------------------
+    clamp_counts = {}
+    for d in TENORS_DAYS:
+        clamp_counts[f"atm_{d}d_exact"] = clamp_df(out, f"atm_{d}d_exact", ATM_MIN, ATM_MAX)
+        clamp_counts[f"atm_{d}d_closest"] = clamp_df(out, f"atm_{d}d_closest", ATM_MIN, ATM_MAX)
+
+        clamp_counts[f"rr25_{d}d_exact"] = clamp_df(out, f"rr25_{d}d_exact", RR_MIN, RR_MAX)
+        clamp_counts[f"rr25_{d}d_closest"] = clamp_df(out, f"rr25_{d}d_closest", RR_MIN, RR_MAX)
+
+        clamp_counts[f"bf25_{d}d_exact"] = clamp_df(out, f"bf25_{d}d_exact", BF_MIN, BF_MAX)
+        clamp_counts[f"bf25_{d}d_closest"] = clamp_df(out, f"bf25_{d}d_closest", BF_MIN, BF_MAX)
+
+    clamp_counts["term_slope_atm_exact"] = clamp_df(out, "term_slope_atm_exact", SLOPE_MIN, SLOPE_MAX)
+    clamp_counts["term_slope_atm_closest"] = clamp_df(out, "term_slope_atm_closest", SLOPE_MIN, SLOPE_MAX)
+    clamp_counts["term_slope_rr25_exact"] = clamp_df(out, "term_slope_rr25_exact", SLOPE_MIN, SLOPE_MAX)
+    clamp_counts["term_slope_rr25_closest"] = clamp_df(out, "term_slope_rr25_closest", SLOPE_MIN, SLOPE_MAX)
+
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(OUT_PATH, index=False)
 
     print("\nDone.")
     print(f"Wrote: {OUT_PATH}")
     print(f"Days: {len(out):,}")
+
+    # show clamp summary
+    bad_total = sum(clamp_counts.values())
+    print(f"\nClamp summary: total values set to NaN = {bad_total:,}")
+    worst = sorted(clamp_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    print("Top 10 clamped columns:")
+    for k, v in worst:
+        print(f"- {k}: {v:,}")
 
     cols = [c for c in out.columns if c != "quote_date"]
     coverage = out[cols].notna().mean().sort_values(ascending=True)
@@ -243,7 +297,6 @@ def main():
     print("\nCoverage (fraction non-NaN) — highest 12:")
     print(coverage.tail(12).to_string())
 
-    # show maturity gap stats for closest ATM
     gap_cols = [f"gap_days_{d}d" for d in TENORS_DAYS]
     print("\nClosest-maturity gap days (ATM) summary:")
     for c in gap_cols:
